@@ -114,18 +114,21 @@ async function* iterEntries(): AsyncGenerator<any> {
       let raw: string;
       try { raw = await readFile(path, 'utf-8'); } catch { continue; }
 
-      if (path.endsWith('.jsonl') || raw.startsWith('{') && raw.includes('\n{')) {
-        for (const line of raw.split('\n')) {
-          if (!line.trim()) continue;
-          try { yield JSON.parse(line); } catch { /* skip */ }
-        }
-      } else if (path.endsWith('.json')) {
+      // .jsonl → NDJSON only. Otherwise prefer whole-file JSON.parse first;
+      // fall back to NDJSON only if that fails.
+      if (!path.endsWith('.jsonl')) {
         try {
           const data = JSON.parse(raw);
-          if (Array.isArray(data)) for (const e of data) yield e;
-          else if (Array.isArray(data?.messages)) for (const e of data.messages) yield e;
-          else if (Array.isArray(data?.history)) for (const e of data.history) yield e;
-        } catch { /* skip */ }
+          if (Array.isArray(data)) { for (const e of data) yield e; continue; }
+          if (Array.isArray(data?.messages)) { for (const e of data.messages) yield e; continue; }
+          if (Array.isArray(data?.history))  { for (const e of data.history)  yield e; continue; }
+          continue;
+        } catch { /* fall through to NDJSON */ }
+      }
+
+      for (const line of raw.split('\n')) {
+        if (!line.trim()) continue;
+        try { yield JSON.parse(line); } catch { /* skip */ }
       }
     }
   }

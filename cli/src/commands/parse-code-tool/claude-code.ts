@@ -21,7 +21,14 @@ type ParsedCall = {
   sessionId: string;
 };
 
-// Claude pricing per 1K tokens (input, output). Cache reads/writes folded into input.
+// Anthropic billing multipliers vs. base input rate:
+//   cache_creation = 1.25× input  (5m TTL ephemeral cache)
+//   cache_read     = 0.10× input  (cache hit)
+// Source: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching#pricing
+const CACHE_WRITE_MULTIPLIER = 1.25;
+const CACHE_READ_MULTIPLIER = 0.10;
+
+// Claude pricing per 1K tokens (input, output). Cache tokens are priced from input.
 const MODEL_COSTS: Record<string, [number, number]> = {
   'claude-opus-4-8': [0.015, 0.075],
   'claude-opus-4-7': [0.015, 0.075],
@@ -44,10 +51,17 @@ function normalizeModelId(raw: string): string {
   return m;
 }
 
-function calculateCost(model: string, input: number, output: number): number {
+function calculateCost(
+  model: string,
+  input: number,
+  output: number,
+  cacheCreate = 0,
+  cacheRead = 0,
+): number {
   const norm = normalizeModelId(model);
   const [inCost, outCost] = MODEL_COSTS[norm] ?? [0.003, 0.015];
-  return (input * inCost + output * outCost) / 1000;
+  const inputBilled = input + cacheCreate * CACHE_WRITE_MULTIPLIER + cacheRead * CACHE_READ_MULTIPLIER;
+  return (inputBilled * inCost + output * outCost) / 1000;
 }
 
 function parseTimestamp(value: unknown): number | null {
@@ -91,6 +105,11 @@ async function parseTranscript(
     let entry: any;
     try { entry = JSON.parse(line); } catch { continue; }
 
+    // Only count assistant turns. Tool-result echoes and resumed-session
+    // synthetic entries can carry a copied `usage` block; filtering by type
+    // avoids double-counting them.
+    if (entry?.type !== 'assistant') continue;
+
     const msg = entry?.message;
     const usage: Usage | undefined = msg?.usage;
     if (!usage) continue;
@@ -102,10 +121,10 @@ async function parseTranscript(
     const project = cwd ? basename(cwd) : 'unknown';
     if (targetProject && project !== targetProject) continue;
 
-    const inputTokens =
-      (usage.input_tokens ?? 0) +
-      (usage.cache_creation_input_tokens ?? 0) +
-      (usage.cache_read_input_tokens ?? 0);
+    const baseInput = usage.input_tokens ?? 0;
+    const cacheCreate = usage.cache_creation_input_tokens ?? 0;
+    const cacheRead = usage.cache_read_input_tokens ?? 0;
+    const inputTokens = baseInput + cacheCreate + cacheRead;
     const outputTokens = usage.output_tokens ?? 0;
     if (inputTokens === 0 && outputTokens === 0) continue;
 
@@ -114,7 +133,7 @@ async function parseTranscript(
       model: normalizeModelId(model),
       inputTokens,
       outputTokens,
-      costUSD: calculateCost(model, inputTokens, outputTokens),
+      costUSD: calculateCost(model, baseInput, outputTokens, cacheCreate, cacheRead),
       timestamp: new Date(ts).toISOString(),
       project,
       sessionId,

@@ -467,8 +467,10 @@ async function publishCloudWatchMetrics(
       }
     }
 
-    // Per-tool/per-model breakdown — enables per-IDE, per-model dashboards
-    // and feeds an OTel-compatible EMF log line for downstream collectors.
+    // Per-tool/per-model breakdown — enables per-IDE, per-model dashboards.
+    // For OTel/AMP consumers, point an ADOT collector at this CloudWatch
+    // namespace via Metric Streams; that avoids the cost of double-publishing
+    // the same datapoints from Lambda stdout.
     if (Array.isArray(detail.ai_dora.tool_breakdown)) {
       for (const entry of detail.ai_dora.tool_breakdown) {
         if (!entry?.tool || !entry?.model) continue;
@@ -493,17 +495,6 @@ async function publishCloudWatchMetrics(
           });
         }
       }
-
-      // OTel-compatible Embedded Metric Format line. CloudWatch picks this up
-      // automatically from Lambda stdout. An ADOT collector configured against
-      // this log group can scrape it as OTLP metrics with the same dimensions.
-      emitOtelEmf({
-        namespace: METRIC_NAMESPACE,
-        teamId: detail.team_id,
-        repo: detail.repo,
-        breakdown: detail.ai_dora.tool_breakdown,
-        timestamp: metricTimestamp,
-      });
     }
   }
 
@@ -795,41 +786,3 @@ function mapUnit(unit: string): StandardUnit {
   return unitMap[unit?.toLowerCase()] ?? StandardUnit.None;
 }
 
-function emitOtelEmf(args: {
-  namespace: string;
-  teamId: string;
-  repo: string;
-  breakdown: ToolBreakdownEntry[];
-  timestamp: Date;
-}): void {
-  for (const entry of args.breakdown) {
-    if (!entry?.tool || !entry?.model) continue;
-    const emf = {
-      _aws: {
-        Timestamp: args.timestamp.getTime(),
-        CloudWatchMetrics: [
-          {
-            Namespace: args.namespace,
-            Dimensions: [['TeamId', 'Repository', 'Tool', 'Model']],
-            Metrics: [
-              { Name: 'AIInputTokens', Unit: 'Count' },
-              { Name: 'AIOutputTokens', Unit: 'Count' },
-              { Name: 'AICostUSD', Unit: 'None' },
-              { Name: 'AICallCount', Unit: 'Count' },
-            ],
-          },
-        ],
-      },
-      TeamId: args.teamId,
-      Repository: args.repo,
-      Tool: entry.tool,
-      Model: entry.model,
-      AIInputTokens: entry.input ?? 0,
-      AIOutputTokens: entry.output ?? 0,
-      AICostUSD: entry.cost ?? 0,
-      AICallCount: 1,
-    };
-    // CloudWatch parses JSON lines on stdout when they contain "_aws".
-    console.log(JSON.stringify(emf));
-  }
-}

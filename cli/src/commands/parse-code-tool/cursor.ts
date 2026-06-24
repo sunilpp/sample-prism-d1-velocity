@@ -114,19 +114,22 @@ async function* iterEntries(): AsyncGenerator<any> {
     let raw: string;
     try { raw = await readFile(path, 'utf-8'); } catch { continue; }
 
-    // NDJSON (audit.log) vs JSON (usage.json) — try both
-    if (path.endsWith('.log') || raw.startsWith('{') && raw.includes('\n{')) {
-      for (const line of raw.split('\n')) {
-        if (!line.trim()) continue;
-        try { yield JSON.parse(line); } catch { /* skip */ }
-      }
-    } else {
+    // .log → NDJSON only. Otherwise prefer whole-file JSON.parse first (handles
+    // pretty-printed JSON); fall back to NDJSON only if that fails.
+    if (!path.endsWith('.log')) {
       try {
         const data = JSON.parse(raw);
-        if (Array.isArray(data)) for (const e of data) yield e;
-        else if (Array.isArray(data?.events)) for (const e of data.events) yield e;
-        else if (Array.isArray(data?.usage)) for (const e of data.usage) yield e;
-      } catch { /* skip */ }
+        if (Array.isArray(data)) { for (const e of data) yield e; continue; }
+        if (Array.isArray(data?.events)) { for (const e of data.events) yield e; continue; }
+        if (Array.isArray(data?.usage))  { for (const e of data.usage)  yield e; continue; }
+        // Parseable but not a recognized shape — skip the file.
+        continue;
+      } catch { /* fall through to NDJSON */ }
+    }
+
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) continue;
+      try { yield JSON.parse(line); } catch { /* skip */ }
     }
   }
 }

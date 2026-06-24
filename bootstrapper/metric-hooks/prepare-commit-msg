@@ -12,6 +12,9 @@
 
 set -uo pipefail
 
+# Hard guarantee: hook must never block a commit, regardless of what fails below.
+trap 'exit 0' EXIT
+
 COMMIT_MSG_FILE="$1"
 COMMIT_SOURCE="${2:-}"
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo ".")
@@ -102,12 +105,22 @@ delta_with_snapshot() {
     cur_out=$(echo "${json}" | jq -r '[.models[]?.outputTokens // 0] | add // 0' 2>/dev/null || echo "0")
     cur_cost=$(echo "${json}" | jq -r '.overview.cost // 0' 2>/dev/null || echo "0")
 
-    local prev_in=0 prev_out=0 prev_cost=0
-    if [[ -f "${snapshot}" ]]; then
-        prev_in=$(jq -r '.inputTokens // 0' "${snapshot}" 2>/dev/null || echo "0")
-        prev_out=$(jq -r '.outputTokens // 0' "${snapshot}" 2>/dev/null || echo "0")
-        prev_cost=$(jq -r '.cost // 0' "${snapshot}" 2>/dev/null || echo "0")
+    # First-commit (no prior snapshot): seed the snapshot with the current totals
+    # and return a zero delta. Without this guard, the first commit on a freshly
+    # installed hook would report the parser's entire lifetime token count.
+    local top_model
+    top_model=$(echo "${json}" | jq -r '(.models // []) | sort_by(-.outputTokens) | .[0].name // ""' 2>/dev/null || echo "")
+
+    if [[ ! -f "${snapshot}" ]]; then
+        printf '{"inputTokens":%s,"outputTokens":%s,"cost":%s}\n' "${cur_in}" "${cur_out}" "${cur_cost}" > "${snapshot}"
+        printf '{"tool":"%s","model":"%s","input":0,"output":0,"cost":0}\n' "${tool}" "${top_model}"
+        return
     fi
+
+    local prev_in prev_out prev_cost
+    prev_in=$(jq -r '.inputTokens // 0' "${snapshot}" 2>/dev/null || echo "0")
+    prev_out=$(jq -r '.outputTokens // 0' "${snapshot}" 2>/dev/null || echo "0")
+    prev_cost=$(jq -r '.cost // 0' "${snapshot}" 2>/dev/null || echo "0")
 
     local d_in=$(( cur_in - prev_in ))
     local d_out=$(( cur_out - prev_out ))
@@ -116,10 +129,6 @@ delta_with_snapshot() {
     [[ ${d_in} -lt 0 ]] && d_in=0
     [[ ${d_out} -lt 0 ]] && d_out=0
     if (( $(echo "${d_cost} < 0" | bc -l 2>/dev/null) )); then d_cost="0"; fi
-
-    # Capture top model id for this tool (highest output tokens)
-    local top_model
-    top_model=$(echo "${json}" | jq -r '(.models // []) | sort_by(-.outputTokens) | .[0].name // ""' 2>/dev/null || echo "")
 
     printf '{"inputTokens":%s,"outputTokens":%s,"cost":%s}\n' "${cur_in}" "${cur_out}" "${cur_cost}" > "${snapshot}"
     # Emit delta as compact JSON for caller
