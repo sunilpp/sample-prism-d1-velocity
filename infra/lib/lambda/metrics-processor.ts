@@ -24,6 +24,14 @@ interface DoraMetrics {
   mttr_seconds: number | null;
 }
 
+interface ToolBreakdownEntry {
+  tool: string;
+  model: string;
+  input: number;
+  output: number;
+  cost: number;
+}
+
 interface AiDoraMetrics {
   ai_acceptance_rate: number | null;
   ai_to_merge_ratio: number | null;
@@ -34,6 +42,7 @@ interface AiDoraMetrics {
   total_input_tokens: number | null;
   total_output_tokens: number | null;
   total_cost_usd: number | null;
+  tool_breakdown?: ToolBreakdownEntry[];
 }
 
 interface EvalDetail {
@@ -457,6 +466,45 @@ async function publishCloudWatchMetrics(
         });
       }
     }
+
+    // Per-tool/per-model breakdown — enables per-IDE, per-model dashboards
+    // and feeds an OTel-compatible EMF log line for downstream collectors.
+    if (Array.isArray(detail.ai_dora.tool_breakdown)) {
+      for (const entry of detail.ai_dora.tool_breakdown) {
+        if (!entry?.tool || !entry?.model) continue;
+        const toolDims = [
+          ...sharedDimensions,
+          { Name: 'Tool', Value: entry.tool },
+          { Name: 'Model', Value: entry.model },
+        ];
+        const toolPairs: Array<[string, number, StandardUnit]> = [
+          ['AIInputTokens', entry.input ?? 0, StandardUnit.Count],
+          ['AIOutputTokens', entry.output ?? 0, StandardUnit.Count],
+          ['AICostUSD', entry.cost ?? 0, StandardUnit.None],
+          ['AICallCount', 1, StandardUnit.Count],
+        ];
+        for (const [name, value, unit] of toolPairs) {
+          metricData.push({
+            MetricName: name,
+            Value: value,
+            Unit: unit,
+            Dimensions: toolDims,
+            Timestamp: metricTimestamp,
+          });
+        }
+      }
+
+      // OTel-compatible Embedded Metric Format line. CloudWatch picks this up
+      // automatically from Lambda stdout. An ADOT collector configured against
+      // this log group can scrape it as OTLP metrics with the same dimensions.
+      emitOtelEmf({
+        namespace: METRIC_NAMESPACE,
+        teamId: detail.team_id,
+        repo: detail.repo,
+        breakdown: detail.ai_dora.tool_breakdown,
+        timestamp: metricTimestamp,
+      });
+    }
   }
 
   // Agent metrics
@@ -745,4 +793,43 @@ function mapUnit(unit: string): StandardUnit {
     none: StandardUnit.None,
   };
   return unitMap[unit?.toLowerCase()] ?? StandardUnit.None;
+}
+
+function emitOtelEmf(args: {
+  namespace: string;
+  teamId: string;
+  repo: string;
+  breakdown: ToolBreakdownEntry[];
+  timestamp: Date;
+}): void {
+  for (const entry of args.breakdown) {
+    if (!entry?.tool || !entry?.model) continue;
+    const emf = {
+      _aws: {
+        Timestamp: args.timestamp.getTime(),
+        CloudWatchMetrics: [
+          {
+            Namespace: args.namespace,
+            Dimensions: [['TeamId', 'Repository', 'Tool', 'Model']],
+            Metrics: [
+              { Name: 'AIInputTokens', Unit: 'Count' },
+              { Name: 'AIOutputTokens', Unit: 'Count' },
+              { Name: 'AICostUSD', Unit: 'None' },
+              { Name: 'AICallCount', Unit: 'Count' },
+            ],
+          },
+        ],
+      },
+      TeamId: args.teamId,
+      Repository: args.repo,
+      Tool: entry.tool,
+      Model: entry.model,
+      AIInputTokens: entry.input ?? 0,
+      AIOutputTokens: entry.output ?? 0,
+      AICostUSD: entry.cost ?? 0,
+      AICallCount: 1,
+    };
+    // CloudWatch parses JSON lines on stdout when they contain "_aws".
+    console.log(JSON.stringify(emf));
+  }
 }

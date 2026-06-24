@@ -64,6 +64,8 @@ jobs:
           TOTAL_INPUT_TOKENS=0
           TOTAL_OUTPUT_TOKENS=0
           TOTAL_COST="0"
+          # Per-tool aggregation across the PR — keyed by "<tool>|<model>"
+          TOOL_BREAKDOWN="{}"
           for SHA in $(git rev-list "${BASE_SHA}..${HEAD_SHA}"); do
             MSG=$(git log -1 --format='%B' "${SHA}")
             if echo "${MSG}" | grep -q '^AI-Origin: ai-generated'; then
@@ -84,6 +86,29 @@ jobs:
             TOTAL_INPUT_TOKENS=$((TOTAL_INPUT_TOKENS + INPUT_T))
             TOTAL_OUTPUT_TOKENS=$((TOTAL_OUTPUT_TOKENS + OUTPUT_T))
             TOTAL_COST=$(echo "${TOTAL_COST} + ${COST_T}" | bc -l)
+
+            # AI-Summary trailer: base64-encoded JSON array of {tool,model,input,output,cost}
+            SUMMARY_B64=$(echo "${MSG}" | grep -oP '(?<=^AI-Summary: )[A-Za-z0-9+/=]+' | head -1 || true)
+            if [[ -n "${SUMMARY_B64}" ]]; then
+              SUMMARY_JSON=$(echo "${SUMMARY_B64}" | base64 -d 2>/dev/null || echo "")
+              if [[ -n "${SUMMARY_JSON}" ]] && echo "${SUMMARY_JSON}" | jq empty 2>/dev/null; then
+                TOOL_BREAKDOWN=$(jq -c \
+                  --argjson cur "${TOOL_BREAKDOWN}" \
+                  --argjson add "${SUMMARY_JSON}" \
+                  -n '
+                    ($add | map(select((.input // 0) + (.output // 0) > 0))) as $entries
+                    | reduce $entries[] as $e ($cur;
+                        ($e.tool // "unknown") + "|" + ($e.model // "unknown") as $k
+                        | .[$k] = {
+                            tool:   ($e.tool   // "unknown"),
+                            model:  ($e.model  // "unknown"),
+                            input:  ((.[$k].input  // 0) + ($e.input  // 0)),
+                            output: ((.[$k].output // 0) + ($e.output // 0)),
+                            cost:   ((.[$k].cost   // 0) + ($e.cost   // 0)),
+                          })
+                  ' 2>/dev/null || echo "${TOOL_BREAKDOWN}")
+              fi
+            fi
           done
 
           AI_COMMITS=$((AI_GENERATED + AI_ASSISTED))
@@ -93,8 +118,11 @@ jobs:
             AI_RATIO="0"
           fi
 
-          # Detect tools used
-          TOOLS_USED=$(git log "${BASE_SHA}..${HEAD_SHA}" --format='%B' | grep '^AI-Origin:' | sort -u | head -5 | tr '\n' ',' | sed 's/,$//')
+          # Flatten the keyed map to an array for downstream consumption
+          TOOL_BREAKDOWN_ARRAY=$(echo "${TOOL_BREAKDOWN}" | jq -c '[.[]]')
+
+          # Distinct tools used in this PR (sorted for stable output)
+          TOOLS_USED=$(echo "${TOOL_BREAKDOWN_ARRAY}" | jq -c '[.[].tool] | unique')
 
           echo "total_commits=${TOTAL_COMMITS}" >> "$GITHUB_OUTPUT"
           echo "ai_commits=${AI_COMMITS}" >> "$GITHUB_OUTPUT"
@@ -105,6 +133,8 @@ jobs:
           echo "total_input_tokens=${TOTAL_INPUT_TOKENS}" >> "$GITHUB_OUTPUT"
           echo "total_output_tokens=${TOTAL_OUTPUT_TOKENS}" >> "$GITHUB_OUTPUT"
           echo "total_cost=${TOTAL_COST}" >> "$GITHUB_OUTPUT"
+          echo "tool_breakdown=${TOOL_BREAKDOWN_ARRAY}" >> "$GITHUB_OUTPUT"
+          echo "tools_used=${TOOLS_USED}" >> "$GITHUB_OUTPUT"
 
       - name: Calculate lead time
         id: lead-time
@@ -181,6 +211,8 @@ jobs:
             --argjson total_input_tokens "${{ steps.ai-ratio.outputs.total_input_tokens }}" \
             --argjson total_output_tokens "${{ steps.ai-ratio.outputs.total_output_tokens }}" \
             --arg total_cost "${{ steps.ai-ratio.outputs.total_cost }}" \
+            --argjson tool_breakdown '${{ steps.ai-ratio.outputs.tool_breakdown }}' \
+            --argjson tools_used '${{ steps.ai-ratio.outputs.tools_used }}' \
             '{
               "team_id": $team_id,
               "repo": $repo,
@@ -192,9 +224,10 @@ jobs:
                 "unit": "ratio"
               },
               "ai_context": {
-                "tool": "github-actions",
+                "tool": (if ($tools_used | length) > 0 then ($tools_used | join(",")) else "github-actions" end),
                 "model": "n/a",
-                "origin": (if $ai_ratio > 0.5 then "ai-assisted" elif $ai_ratio > 0 then "ai-assisted" else "human" end)
+                "origin": (if $ai_ratio > 0.5 then "ai-assisted" elif $ai_ratio > 0 then "ai-assisted" else "human" end),
+                "tools_used": $tools_used
               },
               "dora": {
                 "deployment_frequency": 1,
@@ -209,7 +242,8 @@ jobs:
                 "ai_assisted_commits": $ai_assisted,
                 "total_input_tokens": $total_input_tokens,
                 "total_output_tokens": $total_output_tokens,
-                "total_cost_usd": (if $total_cost != "0" and $total_cost != "" then ($total_cost | tonumber) else 0 end)
+                "total_cost_usd": (if $total_cost != "0" and $total_cost != "" then ($total_cost | tonumber) else 0 end),
+                "tool_breakdown": $tool_breakdown
               },
               "pr": {
                 "number": ($pr_number | tonumber),
