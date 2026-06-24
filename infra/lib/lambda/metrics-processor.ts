@@ -24,6 +24,14 @@ interface DoraMetrics {
   mttr_seconds: number | null;
 }
 
+interface ToolBreakdownEntry {
+  tool: string;
+  model: string;
+  input: number;
+  output: number;
+  cost: number;
+}
+
 interface AiDoraMetrics {
   ai_acceptance_rate: number | null;
   ai_to_merge_ratio: number | null;
@@ -34,6 +42,7 @@ interface AiDoraMetrics {
   total_input_tokens: number | null;
   total_output_tokens: number | null;
   total_cost_usd: number | null;
+  tool_breakdown?: ToolBreakdownEntry[];
 }
 
 interface EvalDetail {
@@ -457,6 +466,36 @@ async function publishCloudWatchMetrics(
         });
       }
     }
+
+    // Per-tool/per-model breakdown — enables per-IDE, per-model dashboards.
+    // For OTel/AMP consumers, point an ADOT collector at this CloudWatch
+    // namespace via Metric Streams; that avoids the cost of double-publishing
+    // the same datapoints from Lambda stdout.
+    if (Array.isArray(detail.ai_dora.tool_breakdown)) {
+      for (const entry of detail.ai_dora.tool_breakdown) {
+        if (!entry?.tool || !entry?.model) continue;
+        const toolDims = [
+          ...sharedDimensions,
+          { Name: 'Tool', Value: entry.tool },
+          { Name: 'Model', Value: entry.model },
+        ];
+        const toolPairs: Array<[string, number, StandardUnit]> = [
+          ['AIInputTokens', entry.input ?? 0, StandardUnit.Count],
+          ['AIOutputTokens', entry.output ?? 0, StandardUnit.Count],
+          ['AICostUSD', entry.cost ?? 0, StandardUnit.None],
+          ['AICallCount', 1, StandardUnit.Count],
+        ];
+        for (const [name, value, unit] of toolPairs) {
+          metricData.push({
+            MetricName: name,
+            Value: value,
+            Unit: unit,
+            Dimensions: toolDims,
+            Timestamp: metricTimestamp,
+          });
+        }
+      }
+    }
   }
 
   // Agent metrics
@@ -746,3 +785,4 @@ function mapUnit(unit: string): StandardUnit {
   };
   return unitMap[unit?.toLowerCase()] ?? StandardUnit.None;
 }
+

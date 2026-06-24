@@ -1,28 +1,28 @@
 #!/usr/bin/env bash
 # prepare-commit-msg — Detect AI-generated commits and add origin trailers.
 #
-# This hook detects if the commit was made via Claude Code, Kiro, or other AI tools
-# and adds AI-Origin, AI-Model, AI-Token, and Spec-Ref trailers to the commit message.
-# Token tracking powered by codeburn (npm install -g codeburn).
+# Adds trailers: AI-Origin, AI-Tool, AI-Model, AI-Input-Tokens, AI-Output-Tokens,
+# AI-Cost, Spec-Ref, and a compact AI-Summary (base64 JSON) with per-tool breakdown.
 #
-# Installation: metric-hooks/install.sh
+# Token sources (probed in order, first that returns non-empty wins for the detected tool):
+#   1. prism-cli parse-code-tool <tool>  (Claude Code, Cursor, Kiro CLI/IDE, Q Developer)
+#   2. codeburn report                   (covers tools without a native parser)
+#
+# Installation: prism-cli bootstrapper install-git-hooks
 
 set -uo pipefail
+
+# Hard guarantee: hook must never block a commit, regardless of what fails below.
+trap 'exit 0' EXIT
 
 COMMIT_MSG_FILE="$1"
 COMMIT_SOURCE="${2:-}"
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo ".")
 SHA="${3:-}"
 
-# Skip for merge commits, amend, and squash
-if [[ "${COMMIT_SOURCE}" == "merge" || "${COMMIT_SOURCE}" == "squash" ]]; then
-    exit 0
-fi
-
-# Don't add trailers if they already exist (e.g., user added them manually)
-if grep -q '^AI-Origin:' "${COMMIT_MSG_FILE}" 2>/dev/null; then
-    exit 0
-fi
+# Skip merge/squash; never duplicate trailers if user added them manually
+if [[ "${COMMIT_SOURCE}" == "merge" || "${COMMIT_SOURCE}" == "squash" ]]; then exit 0; fi
+if grep -q '^AI-Origin:' "${COMMIT_MSG_FILE}" 2>/dev/null; then exit 0; fi
 
 # ---------------------------------------------------------------------------
 # Detect AI tool involvement
@@ -31,102 +31,177 @@ AI_ORIGIN="human"
 AI_MODEL=""
 AI_TOOL=""
 
-# Check for Claude Code session
-# Claude Code sets CLAUDE_CODE environment variable or leaves markers
 if [[ -n "${CLAUDE_CODE:-}" || -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
     AI_ORIGIN="ai-generated"
     AI_TOOL="claude-code"
-    AI_MODEL="${ANTHROPIC_MODEL:-us.anthropic.claude-sonnet-4-5-20250929-v1:0}"
+    AI_MODEL="${ANTHROPIC_MODEL:-}"
 fi
 
-# Check for Kiro markers
-# Kiro CLI sets KIRO_SESSION_ID; Kiro IDE sets TERM_PROGRAM=kiro
-# Kiro Source Control panel sets VSCODE_GIT_ASKPASS_NODE with "kiro" in path
-if [[ -n "${KIRO_SESSION_ID:-}" || -n "${KIRO_SESSION:-}" || "${TERM_PROGRAM:-}" == "kiro" || "${VSCODE_GIT_ASKPASS_NODE:-}" == *"kiro"* || "${GIT_ASKPASS:-}" == *"kiro"* ]]; then
+if [[ -n "${KIRO_SESSION_ID:-}" || -n "${KIRO_SESSION:-}" || "${TERM_PROGRAM:-}" == "kiro" \
+      || "${VSCODE_GIT_ASKPASS_NODE:-}" == *"kiro"* || "${GIT_ASKPASS:-}" == *"kiro"* ]]; then
     AI_ORIGIN="ai-generated"
     AI_TOOL="kiro"
 fi
 
-# Check for Amazon Q Developer
-if [[ -n "${Q_DEVELOPER_SESSION:-}" ]]; then
+if [[ -n "${Q_DEVELOPER_SESSION:-}" || "${TERM_PROGRAM:-}" == "amazonq" ]]; then
     AI_ORIGIN="ai-generated"
     AI_TOOL="q-developer"
+fi
+
+if [[ -n "${CURSOR_SESSION_ID:-}" || "${TERM_PROGRAM:-}" == "cursor" \
+      || "${VSCODE_GIT_ASKPASS_NODE:-}" == *"Cursor"* || "${GIT_ASKPASS:-}" == *"Cursor"* ]]; then
+    AI_ORIGIN="ai-generated"
+    AI_TOOL="cursor"
 fi
 
 # ---------------------------------------------------------------------------
 # Detect spec references
 # ---------------------------------------------------------------------------
 SPEC_REF=""
-
-# Check if any staged file is a spec
 STAGED_SPECS=$(git diff --cached --name-only 2>/dev/null | grep -E '(specs/|\.kiro/specs/)' | head -1 || true)
-if [[ -n "${STAGED_SPECS}" ]]; then
-    SPEC_REF="${STAGED_SPECS}"
+[[ -n "${STAGED_SPECS}" ]] && SPEC_REF="${STAGED_SPECS}"
+MSG_SPEC=$(grep -oP '(?<=Spec-Ref: ).*' "${COMMIT_MSG_FILE}" 2>/dev/null | head -1 || true)
+[[ -n "${MSG_SPEC}" ]] && SPEC_REF="${MSG_SPEC}"
+
+# ---------------------------------------------------------------------------
+# Token tracking: query each known tool's native parser, then fall back to codeburn.
+# Maintain per-tool snapshot under ~/.prism/tokentracker/<project>/<tool>.json so
+# tokens for different tools used on the same project don't clobber each other.
+# ---------------------------------------------------------------------------
+PROJECT_BASENAME=$(basename "$REPO_ROOT")
+TRACKER_DIR="${HOME}/.prism/tokentracker/${PROJECT_BASENAME}"
+mkdir -p "${TRACKER_DIR}"
+
+# Probe a tool's native parser, returning JSON on stdout or empty string.
+# Additional CLI args may be passed positionally after the tool name.
+probe_tool() {
+    local tool="$1"; shift
+    if ! command -v prism-cli &>/dev/null; then echo ""; return; fi
+    prism-cli parse-code-tool "${tool}" --project "${PROJECT_BASENAME}" --format json "$@" 2>/dev/null || echo ""
+}
+
+# Probe codeburn (legacy fallback, used when no native parser matches).
+probe_codeburn() {
+    if ! command -v codeburn &>/dev/null; then echo ""; return; fi
+    local PROJECT_FILTER
+    PROJECT_FILTER=$(echo "$REPO_ROOT" | sed 's|^/||; s|/|-|g')
+    local out
+    out=$(codeburn report -p all --project "${PROJECT_FILTER}" --format json 2>/dev/null || echo "")
+    if [[ -z "${out}" || "$(echo "${out}" | jq -r '.overview.calls // 0' 2>/dev/null)" == "0" ]]; then
+        out=$(codeburn report -p all --project "${PROJECT_BASENAME}" --format json 2>/dev/null || echo "")
+    fi
+    echo "${out}"
+}
+
+# Compute delta against persisted snapshot and update it.
+delta_with_snapshot() {
+    local tool="$1"
+    local json="$2"
+    if [[ -z "${json}" ]] || ! command -v jq &>/dev/null; then echo ""; return; fi
+
+    local snapshot="${TRACKER_DIR}/${tool}.json"
+    local cur_in cur_out cur_cost
+    cur_in=$(echo "${json}" | jq -r '[.models[]?.inputTokens // 0] | add // 0' 2>/dev/null || echo "0")
+    cur_out=$(echo "${json}" | jq -r '[.models[]?.outputTokens // 0] | add // 0' 2>/dev/null || echo "0")
+    cur_cost=$(echo "${json}" | jq -r '.overview.cost // 0' 2>/dev/null || echo "0")
+
+    # First-commit (no prior snapshot): seed the snapshot with the current totals
+    # and return a zero delta. Without this guard, the first commit on a freshly
+    # installed hook would report the parser's entire lifetime token count.
+    local top_model
+    top_model=$(echo "${json}" | jq -r '(.models // []) | sort_by(-.outputTokens) | .[0].name // ""' 2>/dev/null || echo "")
+
+    if [[ ! -f "${snapshot}" ]]; then
+        printf '{"inputTokens":%s,"outputTokens":%s,"cost":%s}\n' "${cur_in}" "${cur_out}" "${cur_cost}" > "${snapshot}"
+        printf '{"tool":"%s","model":"%s","input":0,"output":0,"cost":0}\n' "${tool}" "${top_model}"
+        return
+    fi
+
+    local prev_in prev_out prev_cost
+    prev_in=$(jq -r '.inputTokens // 0' "${snapshot}" 2>/dev/null || echo "0")
+    prev_out=$(jq -r '.outputTokens // 0' "${snapshot}" 2>/dev/null || echo "0")
+    prev_cost=$(jq -r '.cost // 0' "${snapshot}" 2>/dev/null || echo "0")
+
+    local d_in=$(( cur_in - prev_in ))
+    local d_out=$(( cur_out - prev_out ))
+    local d_cost
+    d_cost=$(echo "${cur_cost} - ${prev_cost}" | bc 2>/dev/null || echo "0")
+    [[ ${d_in} -lt 0 ]] && d_in=0
+    [[ ${d_out} -lt 0 ]] && d_out=0
+    if (( $(echo "${d_cost} < 0" | bc -l 2>/dev/null) )); then d_cost="0"; fi
+
+    printf '{"inputTokens":%s,"outputTokens":%s,"cost":%s}\n' "${cur_in}" "${cur_out}" "${cur_cost}" > "${snapshot}"
+    # Emit delta as compact JSON for caller
+    printf '{"tool":"%s","model":"%s","input":%s,"output":%s,"cost":%s}\n' \
+        "${tool}" "${top_model}" "${d_in}" "${d_out}" "${d_cost}"
+}
+
+# Collect per-tool deltas. The "primary" tool (from env detection) anchors the
+# top-level AI-Tool/AI-Model trailers; every other tool with non-zero tokens
+# contributes to the AI-Summary trailer.
+DELTAS_JSON="[]"
+PRIMARY_DELTA=""
+
+collect_delta() {
+    local tool="$1"
+    local probe_out="$2"
+    local delta
+    delta=$(delta_with_snapshot "${tool}" "${probe_out}")
+    [[ -z "${delta}" ]] && return
+    if command -v jq &>/dev/null; then
+        local has_tokens
+        has_tokens=$(echo "${delta}" | jq -r '(.input + .output) > 0' 2>/dev/null || echo "false")
+        if [[ "${has_tokens}" == "true" ]]; then
+            DELTAS_JSON=$(echo "${DELTAS_JSON}" | jq -c --argjson d "${delta}" '. + [$d]')
+            if [[ "${tool}" == "${AI_TOOL}" ]]; then
+                PRIMARY_DELTA="${delta}"
+            fi
+        fi
+    fi
+}
+
+# Always poll all known tools (cheap when the parser finds nothing) — captures the
+# case where a developer uses multiple AI tools on the same commit window.
+if command -v prism-cli &>/dev/null; then
+    collect_delta "claude-code" "$(probe_tool claude-code)"
+    collect_delta "cursor"      "$(probe_tool cursor)"
+    collect_delta "q-developer" "$(probe_tool q-developer)"
+    # Kiro: CLI parser needs session id; IDE parser scans local files
+    if [[ -n "${KIRO_SESSION_ID:-}" ]]; then
+        collect_delta "kiro" "$(probe_tool kiro-cli --session-id "${KIRO_SESSION_ID}")"
+    fi
+    collect_delta "kiro" "$(probe_tool kiro-ide)"
 fi
 
-# Check for spec reference in commit message
-MSG_SPEC=$(grep -oP '(?<=Spec-Ref: ).*' "${COMMIT_MSG_FILE}" 2>/dev/null | head -1 || true)
-if [[ -n "${MSG_SPEC}" ]]; then
-    SPEC_REF="${MSG_SPEC}"
+# Legacy codeburn fallback — only when no parser found anything AND a tool was detected.
+if [[ "${DELTAS_JSON}" == "[]" && -n "${AI_TOOL}" ]]; then
+    collect_delta "${AI_TOOL}" "$(probe_codeburn)"
+fi
+
+# If the env didn't flag a tool but a parser found usage, upgrade origin.
+if [[ "${AI_ORIGIN}" == "human" && "${DELTAS_JSON}" != "[]" ]]; then
+    AI_ORIGIN="ai-assisted"
 fi
 
 # ---------------------------------------------------------------------------
-# Track AI token usage via codeburn (per-project snapshot delta)
+# Aggregate totals across all tools (this is what the GitHub workflow reads).
 # ---------------------------------------------------------------------------
 AI_INPUT_TOKENS=""
 AI_OUTPUT_TOKENS=""
 AI_COST=""
+if [[ "${DELTAS_JSON}" != "[]" ]] && command -v jq &>/dev/null; then
+    AI_INPUT_TOKENS=$(echo "${DELTAS_JSON}" | jq '[.[].input] | add // 0')
+    AI_OUTPUT_TOKENS=$(echo "${DELTAS_JSON}" | jq '[.[].output] | add // 0')
+    AI_COST=$(echo "${DELTAS_JSON}" | jq '[.[].cost] | add // 0')
+fi
 
-if [[ -n "${AI_TOOL}" ]] && (command -v codeburn &>/dev/null || command -v prism-cli &>/dev/null); then
-    PROJECT_FILTER=$(echo "$REPO_ROOT" | sed 's|^/||; s|/|-|g')
-    PROJECT_BASENAME=$(basename "$REPO_ROOT")
-    TRACKER_DIR="${HOME}/.prism/tokentracker"
-    TRACKER_FILE="${TRACKER_DIR}/${PROJECT_BASENAME}.json"
-
-    # Kiro: CLI (KIRO_SESSION_ID) uses kiro-cli, IDE uses kiro-ide
-    # Everything else: use codeburn
-    CODEBURN_JSON=""
-    if [[ "${AI_TOOL}" == "kiro" ]] && command -v prism-cli &>/dev/null; then
-        if [[ -n "${KIRO_SESSION_ID:-}" ]]; then
-            CODEBURN_JSON=$(prism-cli parse-code-tool kiro-cli --session-id "${KIRO_SESSION_ID}" --project "${PROJECT_BASENAME}" --format json 2>/dev/null || echo "")
-        fi
-        # Fall back to kiro-ide (covers IDE env vars and CLI sessions without KIRO_SESSION_ID)
-        if [[ -z "${CODEBURN_JSON}" || "$(echo "${CODEBURN_JSON}" | jq -r '.overview.calls // 0')" == "0" ]]; then
-            CODEBURN_JSON=$(prism-cli parse-code-tool kiro-ide --project "${PROJECT_BASENAME}" --format json 2>/dev/null || echo "")
-        fi
-    elif command -v codeburn &>/dev/null; then
-        CODEBURN_JSON=$(codeburn report -p all --project "${PROJECT_FILTER}" --format json 2>/dev/null || echo "")
-        if [[ -z "${CODEBURN_JSON}" || "$(echo "${CODEBURN_JSON}" | jq -r '.overview.calls // 0')" == "0" ]]; then
-            CODEBURN_JSON=$(codeburn report -p all --project "${PROJECT_BASENAME}" --format json 2>/dev/null || echo "")
-        fi
-    else
-        CODEBURN_JSON=""
-    fi
-
-    if [[ -n "${CODEBURN_JSON}" ]]; then
-        CURRENT_INPUT=$(echo "${CODEBURN_JSON}" | jq -r '[.models[]?.inputTokens // 0] | add // 0' 2>/dev/null || echo "0")
-        CURRENT_OUTPUT=$(echo "${CODEBURN_JSON}" | jq -r '[.models[]?.outputTokens // 0] | add // 0' 2>/dev/null || echo "0")
-        CURRENT_COST=$(echo "${CODEBURN_JSON}" | jq -r '.overview.cost // 0' 2>/dev/null || echo "0")
-
-        if [[ -f "${TRACKER_FILE}" ]]; then
-            PREV_INPUT=$(jq -r '.inputTokens // 0' "${TRACKER_FILE}" 2>/dev/null || echo "0")
-            PREV_OUTPUT=$(jq -r '.outputTokens // 0' "${TRACKER_FILE}" 2>/dev/null || echo "0")
-            PREV_COST=$(jq -r '.cost // 0' "${TRACKER_FILE}" 2>/dev/null || echo "0")
-            AI_INPUT_TOKENS=$(( CURRENT_INPUT - PREV_INPUT ))
-            AI_OUTPUT_TOKENS=$(( CURRENT_OUTPUT - PREV_OUTPUT ))
-            AI_COST=$(echo "${CURRENT_COST} - ${PREV_COST}" | bc 2>/dev/null || echo "0")
-            [[ "${AI_INPUT_TOKENS}" -lt 0 ]] && AI_INPUT_TOKENS=0
-            [[ "${AI_OUTPUT_TOKENS}" -lt 0 ]] && AI_OUTPUT_TOKENS=0
-            AI_COST_NEGATIVE=$(echo "${AI_COST} < 0" | bc 2>/dev/null || echo "0")
-            [[ "${AI_COST_NEGATIVE}" == "1" ]] && AI_COST="0"
-        else
-            AI_INPUT_TOKENS=0; AI_OUTPUT_TOKENS=0; AI_COST="0"
-        fi
-
-        mkdir -p "${TRACKER_DIR}"
-        printf '{"inputTokens":%s,"outputTokens":%s,"cost":%s}\n' \
-            "$CURRENT_INPUT" "$CURRENT_OUTPUT" "$CURRENT_COST" > "${TRACKER_FILE}"
-    fi
+# Anchor top-level model trailer to the primary tool's model (env-detected),
+# or fall back to the largest delta's model.
+if [[ -z "${AI_MODEL}" ]] && command -v jq &>/dev/null && [[ "${DELTAS_JSON}" != "[]" ]]; then
+    AI_MODEL=$(echo "${DELTAS_JSON}" | jq -r 'sort_by(-.output) | .[0].model // ""')
+fi
+if [[ -z "${AI_TOOL}" ]] && command -v jq &>/dev/null && [[ "${DELTAS_JSON}" != "[]" ]]; then
+    AI_TOOL=$(echo "${DELTAS_JSON}" | jq -r 'sort_by(-.output) | .[0].tool // ""')
 fi
 
 # ---------------------------------------------------------------------------
@@ -141,44 +216,41 @@ if [[ -f "${REPO_CONFIG}" ]] && command -v jq &>/dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
-# Append trailers to commit message
+# Append trailers
 # ---------------------------------------------------------------------------
-
-# Ensure there is a blank line before trailers
 if [[ -s "${COMMIT_MSG_FILE}" ]]; then
     LAST_LINE=$(tail -1 "${COMMIT_MSG_FILE}")
-    if [[ -n "${LAST_LINE}" ]]; then
-        echo "" >> "${COMMIT_MSG_FILE}"
-    fi
+    [[ -n "${LAST_LINE}" ]] && echo "" >> "${COMMIT_MSG_FILE}"
 fi
 
 echo "AI-Origin: ${AI_ORIGIN}" >> "${COMMIT_MSG_FILE}"
-
-if [[ -n "${AI_TOOL}" ]]; then
-    echo "AI-Tool: ${AI_TOOL}" >> "${COMMIT_MSG_FILE}"
-fi
-
-if [[ -n "${AI_MODEL}" ]]; then
-    echo "AI-Model: ${AI_MODEL}" >> "${COMMIT_MSG_FILE}"
-fi
+[[ -n "${AI_TOOL}"  ]] && echo "AI-Tool: ${AI_TOOL}"   >> "${COMMIT_MSG_FILE}"
+[[ -n "${AI_MODEL}" ]] && echo "AI-Model: ${AI_MODEL}" >> "${COMMIT_MSG_FILE}"
 
 if [[ -n "${AI_INPUT_TOKENS}" ]]; then
     [[ ${AI_INPUT_TOKENS} -gt ${MAX_TOKENS} ]] && AI_INPUT_TOKENS=${MAX_TOKENS}
     echo "AI-Input-Tokens: ${AI_INPUT_TOKENS}" >> "${COMMIT_MSG_FILE}"
 fi
-
 if [[ -n "${AI_OUTPUT_TOKENS}" ]]; then
     [[ ${AI_OUTPUT_TOKENS} -gt ${MAX_TOKENS} ]] && AI_OUTPUT_TOKENS=${MAX_TOKENS}
     echo "AI-Output-Tokens: ${AI_OUTPUT_TOKENS}" >> "${COMMIT_MSG_FILE}"
 fi
-
 if [[ -n "${AI_COST}" ]]; then
     (( $(echo "${AI_COST} > ${MAX_COST}" | bc -l 2>/dev/null) )) && AI_COST="${MAX_COST}.00"
-    echo "AI-Cost: \$${AI_COST}" >> "${COMMIT_MSG_FILE}"
+    AI_COST_FMT=$(printf '%.4f' "${AI_COST}" 2>/dev/null || echo "${AI_COST}")
+    echo "AI-Cost: \$${AI_COST_FMT}" >> "${COMMIT_MSG_FILE}"
 fi
 
-if [[ -n "${SPEC_REF}" ]]; then
-    echo "Spec-Ref: ${SPEC_REF}" >> "${COMMIT_MSG_FILE}"
+# Per-tool breakdown — compact base64 JSON so the workflow can attribute
+# tokens by tool/model without scanning multiple trailers per commit.
+if [[ "${DELTAS_JSON}" != "[]" ]] && command -v base64 &>/dev/null; then
+    SUMMARY_B64=$(printf '%s' "${DELTAS_JSON}" | base64 | tr -d '\n')
+    # Keep trailer well under git's safe line length (~512 chars)
+    if [[ ${#SUMMARY_B64} -lt 4096 ]]; then
+        echo "AI-Summary: ${SUMMARY_B64}" >> "${COMMIT_MSG_FILE}"
+    fi
 fi
+
+[[ -n "${SPEC_REF}" ]] && echo "Spec-Ref: ${SPEC_REF}" >> "${COMMIT_MSG_FILE}"
 
 exit 0
